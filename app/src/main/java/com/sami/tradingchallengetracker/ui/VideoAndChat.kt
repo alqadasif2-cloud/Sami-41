@@ -633,7 +633,7 @@ fun AndroidGroupChatScreen(
                                 )
                             }
                             Text(
-                                text = if (isOnline) "متصل الآن • حذف تلقائي 48 ساعة" else "غير متصل بالإنترنت",
+                                text = if (isOnline) "متصل الآن • محفوظة دائماً (لا تُحذف بعد 48 ساعة)" else "غير متصل بالإنترنت",
                                 fontSize = 11.sp,
                                 color = if (isOnline) Color(0xFF94A3B8) else Color(0xFFF87171)
                             )

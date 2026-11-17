@@ -4,6 +4,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './src/server/routes.ts';
+import { syncProductionApiServerUrlToCloud } from './src/server/db.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,6 +56,9 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Sami Server] Running on http://0.0.0.0:${PORT}`);
+    if (process.env.APP_URL) {
+      syncProductionApiServerUrlToCloud(process.env.APP_URL).catch(() => {});
+    }
   });
 }
 

@@ -49,6 +49,7 @@ import {
   AuthUser,
 } from './auth.ts';
 import {
+  getVapidPublicKey,
   registerDeviceToken,
   unregisterDeviceToken,
   sendNotificationToUsers,
@@ -433,7 +434,7 @@ apiRouter.get('/channels/:channelId/messages', async (req: Request, res: Respons
       return res.status(403).json({ error: access.error });
     }
 
-    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 80;
+    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 500;
     const beforeTimestamp = req.query.before ? parseInt(String(req.query.before), 10) : undefined;
     const messages = await getChannelMessages(req.params.channelId, limit, beforeTimestamp);
 
@@ -473,6 +474,36 @@ apiRouter.post('/channels/:channelId/messages', async (req: Request, res: Respon
     };
 
     await saveChannelMessage(message);
+
+    // Trigger closed-app push notification (deduplicated by messageId)
+    getChannelById(req.params.channelId)
+      .then((ch) => {
+        const prefix =
+          user.role === 'owner'
+            ? `👑 القائد ${user.displayName || user.username}`
+            : user.role === 'moderator'
+            ? `🛡️ المشرف ${user.displayName || user.username}`
+            : user.displayName || user.username;
+        const snippet = body.audioUrl
+          ? '🎤 رسالة صوتية'
+          : body.fileName
+          ? `📎 ملف: ${body.fileName}`
+          : body.imageUrl
+          ? '📷 صورة'
+          : body.text || 'رسالة جديدة';
+        return dispatchAuthorizedChatPush({
+          senderId: user.id,
+          senderName: user.displayName || user.username,
+          senderRole: user.role,
+          chatType: 'channel',
+          channelId: req.params.channelId,
+          messageId: msgId,
+          title: ch ? `${prefix} • ${ch.name}` : prefix,
+          snippet,
+        });
+      })
+      .catch(() => {});
+
     return res.json({ success: true, message });
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || 'فشل إرسال الرسالة' });
@@ -558,6 +589,34 @@ apiRouter.post('/private-messages', async (req: Request, res: Response) => {
     };
 
     await savePrivateMessageRecord(msgRecord);
+
+    // Trigger closed-app push notification for the private chat recipient
+    const pmTitle =
+      user.id === 1
+        ? '👑 رسالة خاصة من القائد Sami'
+        : effectiveSenderRole === 'owner'
+        ? `👑 رسالة خاصة من القائد ${user.displayName || user.username}`
+        : `💬 رسالة خاصة من ${user.displayName || user.username}`;
+    const pmSnippet = body.audioUrl
+      ? '🎤 رسالة صوتية'
+      : body.fileName
+      ? `📎 ملف: ${body.fileName}`
+      : body.imageUrl
+      ? '📷 صورة'
+      : body.text || 'رسالة جديدة';
+    dispatchAuthorizedChatPush({
+      senderId: user.id,
+      senderName: user.displayName || user.username,
+      senderRole: effectiveSenderRole,
+      chatType: 'private',
+      receiverId,
+      partnerId: user.id,
+      targetUserIds: [receiverId],
+      messageId: id,
+      title: pmTitle,
+      snippet: pmSnippet,
+    }).catch(() => {});
+
     return res.json({ success: true, message: msgRecord });
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || 'فشل إرسال الرسالة الخاصة' });
@@ -714,21 +773,33 @@ apiRouter.get('/files/:filename', (req: Request, res: Response) => {
 });
 
 // ============================================================================
-// FCM PUSH NOTIFICATIONS
+// FCM & WEB PUSH NOTIFICATIONS
 // ============================================================================
+
+apiRouter.get('/fcm/vapid-public-key', (_req: Request, res: Response) => {
+  try {
+    const publicKey = getVapidPublicKey();
+    return res.json({ success: true, publicKey });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'تعذر تجهيز مفتاح الإشعارات' });
+  }
+});
 
 apiRouter.post('/fcm/register', async (req: Request, res: Response) => {
   try {
     const user = getEffectiveUser(req);
-    const { token, deviceId, platform, deviceModel } = req.body;
-    if (!token) return res.status(400).json({ error: 'رمز الجهاز مطلوب' });
+    const { token, subscription, deviceId, platform, deviceModel } = req.body || {};
+    const effectiveToken = String(token || subscription?.endpoint || '').trim();
+    if (!effectiveToken) return res.status(400).json({ error: 'رمز الجهاز أو اشتراك الإشعارات مطلوب' });
+    if (user.id <= 0) return res.status(401).json({ error: 'يرجى تسجيل الدخول أولاً' });
 
     const record = await registerDeviceToken({
-      token,
+      token: effectiveToken,
+      subscription: subscription?.endpoint && subscription?.keys ? subscription : undefined,
       userId: user.id,
       username: user.username,
       deviceId,
-      platform,
+      platform: platform || (subscription ? 'web' : 'android'),
       deviceModel,
     });
 
@@ -741,8 +812,8 @@ apiRouter.post('/fcm/register', async (req: Request, res: Response) => {
 apiRouter.post('/fcm/unregister', async (req: Request, res: Response) => {
   try {
     const user = getEffectiveUser(req);
-    const { token, deviceId } = req.body;
-    await unregisterDeviceToken(user.id, token, deviceId);
+    const { token, deviceId, endpoint } = req.body || {};
+    await unregisterDeviceToken(user.id, token, deviceId, endpoint);
     return res.json({ success: true });
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || 'فشل إلغاء رمز الجهاز' });
@@ -752,16 +823,32 @@ apiRouter.post('/fcm/unregister', async (req: Request, res: Response) => {
 apiRouter.post('/fcm/dispatch', async (req: Request, res: Response) => {
   try {
     const user = getEffectiveUser(req);
-    const { title, body, targetUserIds, receiverId, channelId, chatType } = req.body;
+    const {
+      title,
+      body,
+      targetUserIds,
+      receiverId,
+      partnerId,
+      channelId,
+      chatType,
+      messageId,
+      senderName,
+    } = req.body || {};
+
+    const resolvedChatType = chatType === 'private' ? 'private' : 'channel';
+    const cleanPartnerId = partnerId ? Number(partnerId) : resolvedChatType === 'private' ? user.id : undefined;
 
     const result = await dispatchAuthorizedChatPush({
       senderId: user.id,
-      senderName: user.displayName || user.username,
+      senderName: senderName || user.displayName || user.username,
       senderRole: user.role,
-      chatType: chatType === 'private' ? 'private' : 'channel',
+      chatType: resolvedChatType,
       channelId,
-      receiverId,
-      messageId: `msg_${Date.now()}`,
+      receiverId: receiverId ? Number(receiverId) : undefined,
+      partnerId: cleanPartnerId,
+      targetUserIds: Array.isArray(targetUserIds) ? targetUserIds.map((x: any) => Number(x)) : undefined,
+      messageId: messageId ? String(messageId) : `msg_${Date.now()}`,
+      title: title ? String(title) : undefined,
       snippet: body || title || '',
     });
 

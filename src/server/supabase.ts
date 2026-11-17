@@ -107,17 +107,17 @@ export async function supabaseUpsertChannel(channel: any): Promise<void> {
   }
 }
 
-export async function supabaseGetChannelMessages(channelId: string, limitCount = 80): Promise<any[]> {
+export async function supabaseGetChannelMessages(channelId: string, limitCount = 200): Promise<any[]> {
   if (!supabaseClient) return [];
   try {
     const { data, error } = await supabaseClient
       .from('channel_messages')
       .select('*')
       .eq('channelId', channelId)
-      .order('timestamp', { ascending: true })
+      .order('timestamp', { ascending: false })
       .limit(limitCount);
     if (error || !data) return [];
-    return data;
+    return [...data].reverse();
   } catch {
     return [];
   }
